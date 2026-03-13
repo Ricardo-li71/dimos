@@ -17,13 +17,12 @@ from threading import Event, RLock, Thread
 import time
 from typing import Any
 
-from langchain_core.messages import HumanMessage
 import numpy as np
 from reactivex.disposable import Disposable
 from turbojpeg import TurboJPEG
 
-from dimos.agents.agent_spec import AgentSpec
 from dimos.agents.annotation import skill
+from dimos.agents.mcp.tool_stream import ToolStream
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
@@ -65,7 +64,6 @@ class PersonFollowSkillContainer(Module[Config]):
     global_map: In[PointCloud2]
     cmd_vel: Out[Twist]
 
-    _agent_spec: AgentSpec
     _frequency: float = 20.0  # Hz - control loop frequency
     _max_lost_frames: int = 15  # number of frames to wait before declaring person lost
     _patrolling_module_spec: PatrollingModuleSpec
@@ -79,6 +77,7 @@ class PersonFollowSkillContainer(Module[Config]):
         self._thread: Thread | None = None
         self._should_stop: Event = Event()
         self._lock = RLock()
+        self._tool_stream: ToolStream | None = None
 
         # Use MuJoCo camera intrinsics in simulation mode
         camera_info = self.config.camera_info
@@ -101,7 +100,15 @@ class PersonFollowSkillContainer(Module[Config]):
     def stop(self) -> None:
         self._stop_following()
 
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2)
+            self._thread = None
+
         with self._lock:
+            if self._tool_stream is not None:
+                self._tool_stream.stop()
+                self._tool_stream = None
             if self._tracker is not None:
                 self._tracker.stop()
                 self._tracker = None
@@ -139,6 +146,10 @@ class PersonFollowSkillContainer(Module[Config]):
         """
 
         self._stop_following()
+
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
 
         self._should_stop.clear()
 
@@ -227,12 +238,15 @@ class PersonFollowSkillContainer(Module[Config]):
 
         logger.info(f"EdgeTAM initialized with {len(initial_detections)} detections")
 
+        with self._lock:
+            self._tool_stream = ToolStream("follow_person")
+            self._tool_stream.start()
         self._thread = Thread(target=self._follow_loop, args=(tracker, query), daemon=True)
         self._thread.start()
 
         message = (
             "Found the person. Starting to follow. You can stop following by calling "
-            "the 'stop_following' tool."
+            "the 'stop_following' tool. You will receive streaming updates."
         )
 
         if self._patrolling_module_spec.is_patrolling():
@@ -304,7 +318,12 @@ class PersonFollowSkillContainer(Module[Config]):
     def _send_stop_reason(self, query: str, reason: str) -> None:
         self.cmd_vel.publish(Twist.zero())
         message = f"Person follow stopped for '{query}'. Reason: {reason}."
-        self._agent_spec.add_message(HumanMessage(message))
+        with self._lock:
+            stream = self._tool_stream
+            self._tool_stream = None
+        if stream is not None:
+            stream.send(message)
+            stream.stop()
         logger.info("Person follow stopped", query=query, reason=reason)
 
 

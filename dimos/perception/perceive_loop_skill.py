@@ -21,10 +21,10 @@ from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 import cv2
-from langchain_core.messages import HumanMessage
 
 from dimos.agents.agent_spec import AgentSpec
 from dimos.agents.annotation import skill
+from dimos.agents.mcp.tool_stream import ToolStream
 from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.stream import In
@@ -57,6 +57,7 @@ class PerceiveLoopSkill(Module):
         self._lookout_subscription: DisposableBase | None = None
         self._model_started: bool = False
         self._lock = RLock()
+        self._tool_stream: ToolStream | None = None
 
     @rpc
     def start(self) -> None:
@@ -118,6 +119,8 @@ class PerceiveLoopSkill(Module):
             self._model_started = True
             self._active_lookout = tuple(description_of_things)
             self._then = then
+            self._tool_stream = ToolStream("look_out_for")
+            self._tool_stream.start()
             self._lookout_subscription = sharpest.subscribe(
                 on_next=self._on_image,
                 on_error=lambda e: logger.exception("Error in perceive loop", exc_info=e),
@@ -163,12 +166,19 @@ class PerceiveLoopSkill(Module):
             self._then = None
             self._vl_model.stop()
             self._model_started = False
+            tool_stream = self._tool_stream
+            self._tool_stream = None
 
         if then is None:
-            self._agent_spec.add_message(
-                HumanMessage(f"Found a match for {active_lookout_str}. Please announce audibly.")
-            )
+            if tool_stream is not None:
+                tool_stream.send(
+                    f"Found a match for {active_lookout_str}. Please announce audibly."
+                )
+                tool_stream.stop()
             return
+
+        if tool_stream is not None:
+            tool_stream.stop()
 
         best = max(detections.detections, key=lambda d: d.bbox_2d_volume())
         continuation_context: dict[str, Any] = {
@@ -194,6 +204,9 @@ class PerceiveLoopSkill(Module):
             if self._model_started:
                 self._vl_model.stop()
                 self._model_started = False
+            if self._tool_stream is not None:
+                self._tool_stream.stop()
+                self._tool_stream = None
 
 
 def _write_debug_image(image: Image, detections: ImageDetections2D[Detection2DBBox]) -> None:

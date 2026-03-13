@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 import concurrent.futures
 import json
 import os
@@ -23,14 +24,16 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from reactivex.disposable import Disposable
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 import uvicorn
 
 from dimos.agents.annotation import skill
 from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.rpc_client import RpcCall, RPCClient
+from dimos.core.stream import In
 from dimos.utils.logging_config import setup_logger
 
 if TYPE_CHECKING:
@@ -43,11 +46,12 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST"],
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 app.state.skills = []
 app.state.rpc_calls = {}
+app.state.sse_queues = []  # list[asyncio.Queue] for SSE clients
 
 
 def _jsonrpc_result(req_id: Any, result: Any) -> dict[str, Any]:
@@ -167,7 +171,39 @@ async def mcp_endpoint(request: Request) -> Response:
     return JSONResponse(result)
 
 
+@app.get("/mcp/streams")
+async def streams_sse_endpoint() -> StreamingResponse:
+    """Server-Sent Events endpoint for tool stream updates.
+
+    Clients subscribe here to receive real-time updates from long-running
+    skills that use ``ToolStream``.
+    """
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    app.state.sse_queues.append(queue)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            while True:
+                data = await queue.get()
+                yield f"data: {json.dumps(data)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                app.state.sse_queues.remove(queue)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
 class McpServer(Module):
+    tool_streams: In[dict[str, Any]]
+
     _uvicorn_server: uvicorn.Server | None = None
     _serve_future: concurrent.futures.Future[None] | None = None
 
@@ -175,6 +211,16 @@ class McpServer(Module):
     def start(self) -> None:
         super().start()
         self._start_server()
+
+        loop = self._loop
+
+        def _on_tool_stream_message(msg: dict[str, Any]) -> None:
+            if loop is None:
+                return
+            for queue in list(app.state.sse_queues):
+                asyncio.run_coroutine_threadsafe(queue.put(msg), loop)
+
+        self._disposables.add(Disposable(self.tool_streams.subscribe(_on_tool_stream_message)))
 
     @rpc
     def stop(self) -> None:
