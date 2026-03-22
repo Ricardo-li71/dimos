@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import fcntl
+import threading
 import glob as glob_mod
 import hashlib
 import os
@@ -153,6 +154,18 @@ def _hash_files(files: list[Path]) -> str:
     return h.hexdigest()
 
 
+# Thread-level locks keyed by cache_name (flock only protects cross-process).
+_thread_locks: dict[str, threading.Lock] = {}
+_thread_locks_guard = threading.Lock()
+
+
+def _get_thread_lock(cache_name: str) -> threading.Lock:
+    with _thread_locks_guard:
+        if cache_name not in _thread_locks:
+            _thread_locks[cache_name] = threading.Lock()
+        return _thread_locks[cache_name]
+
+
 def did_change(
     cache_name: str,
     paths: Sequence[PathEntry],
@@ -217,7 +230,8 @@ def did_change(
     lock_file = cache_dir / f"{_safe_filename(cache_name)}.lock"
 
     changed = True
-    with open(lock_file, "w") as lf:
+    thread_lock = _get_thread_lock(cache_name)
+    with thread_lock, open(lock_file, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             if cache_file.exists():
