@@ -248,7 +248,7 @@ class NativeModule(Module[_NativeConfig]):
     def _build_cache_name(self) -> str:
         """Return a stable, unique cache name for this module's build state."""
         source_file = Path(inspect.getfile(type(self))).resolve()
-        return f"native_{source_file}"
+        return f"native_{source_file}:{type(self).__qualname__}"
 
     def _maybe_build(self) -> None:
         """Run ``build_command`` if the executable does not exist or sources changed."""
