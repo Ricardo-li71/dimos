@@ -22,6 +22,7 @@ import stat
 import pytest
 
 from dimos.core.native_module import NativeModule, NativeModuleConfig
+from dimos.utils.change_detect import PathEntry
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +54,7 @@ def build_env(tmp_path: Path) -> dict[str, Path]:
 
 class _RebuildConfig(NativeModuleConfig):
     executable: str = ""
-    rebuild_on_change: list[str] | None = None
+    rebuild_on_change: list[PathEntry] | None = None
 
 
 class _RebuildModule(NativeModule[_RebuildConfig]):

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from dimos.utils.change_detect import clear_cache, did_change
+from dimos.utils.change_detect import Glob, clear_cache, did_change
 
 
 @pytest.fixture(autouse=True)
@@ -70,11 +70,20 @@ def test_file_deleted_returns_true(src_dir: Path) -> None:
 
 
 def test_glob_pattern(src_dir: Path) -> None:
-    pattern = str(src_dir / "*.c")
+    pattern = Glob(str(src_dir / "*.c"))
     assert did_change("glob_cache", [pattern]) is True
     assert did_change("glob_cache", [pattern]) is False
     (src_dir / "a.c").write_text("changed!")
     assert did_change("glob_cache", [pattern]) is True
+
+
+def test_str_with_glob_chars_is_literal(tmp_path: Path) -> None:
+    """A plain str containing '*' must NOT be glob-expanded."""
+    weird_name = tmp_path / "file[1].txt"
+    weird_name.write_text("content")
+    # str path — treated literally, should find the file
+    assert did_change("literal_test", [str(weird_name)]) is True
+    assert did_change("literal_test", [str(weird_name)]) is False
 
 
 def test_separate_cache_names_independent(src_dir: Path) -> None:

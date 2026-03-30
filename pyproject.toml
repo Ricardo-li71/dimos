@@ -63,6 +63,7 @@ dependencies = [
     "annotation-protocol>=1.4.0",
     "lazy_loader",
     "plum-dispatch==2.5.7",
+    "xxhash>=3.0.0",
     # Logging
     "structlog>=25.5.0,<26",
     "colorlog==6.9.0",

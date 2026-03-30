@@ -40,7 +40,6 @@ Example usage::
 
 from __future__ import annotations
 
-import collections
 import enum
 import inspect
 import json
@@ -56,7 +55,7 @@ from pydantic import Field
 
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
-from dimos.utils.change_detect import did_change
+from dimos.utils.change_detect import PathEntry, did_change
 from dimos.utils.logging_config import setup_logger
 
 if sys.version_info < (3, 13):
@@ -82,7 +81,7 @@ class NativeModuleConfig(ModuleConfig):
     extra_env: dict[str, str] = Field(default_factory=dict)
     shutdown_timeout: float = 10.0
     log_format: LogFormat = LogFormat.TEXT
-    rebuild_on_change: list[str] | None = None
+    rebuild_on_change: list[PathEntry] | None = None
 
     # Override in subclasses to exclude fields from CLI arg generation
     cli_exclude: frozenset[str] = frozenset({"rebuild_on_change"})
@@ -134,11 +133,9 @@ class NativeModule(Module[_NativeConfig]):
     _process: subprocess.Popen[bytes] | None = None
     _watchdog: threading.Thread | None = None
     _stopping: bool = False
-    _last_stderr_lines: collections.deque[str]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._last_stderr_lines = collections.deque(maxlen=50)
         self._resolve_paths()
 
     @rpc
@@ -160,13 +157,7 @@ class NativeModule(Module[_NativeConfig]):
         env = {**os.environ, **self.config.extra_env}
         cwd = self.config.cwd or str(Path(self.config.executable).resolve().parent)
 
-        module_name = type(self).__name__
-        logger.info(
-            f"Starting native process: {module_name}",
-            module=module_name,
-            cmd=" ".join(cmd),
-            cwd=cwd,
-        )
+        logger.info("Starting native process", cmd=" ".join(cmd), cwd=cwd)
         self._process = subprocess.Popen(
             cmd,
             env=env,
@@ -174,11 +165,7 @@ class NativeModule(Module[_NativeConfig]):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        logger.info(
-            f"Native process started: {module_name}",
-            module=module_name,
-            pid=self._process.pid,
-        )
+        logger.info("Native process started", pid=self._process.pid)
 
         self._stopping = False
         self._watchdog = threading.Thread(target=self._watch_process, daemon=True)
@@ -201,8 +188,11 @@ class NativeModule(Module[_NativeConfig]):
         if self._watchdog is not None and self._watchdog is not threading.current_thread():
             self._watchdog.join(timeout=2)
         self._watchdog = None
-        self._process = None
+        # Clean up the asyncio loop thread (from ModuleBase) BEFORE
+        # clearing _process — tests use _process=None as their exit
+        # signal, and the loop thread must be joined first.
         super().stop()
+        self._process = None
 
     def _watch_process(self) -> None:
         """Block until the native process exits; trigger stop() if it crashed."""
@@ -217,20 +207,10 @@ class NativeModule(Module[_NativeConfig]):
 
         if self._stopping:
             return
-
-        module_name = type(self).__name__
-        exe_name = Path(self.config.executable).name if self.config.executable else "unknown"
-
-        # Use buffered stderr lines from the reader thread for the crash report.
-        last_stderr = "\n".join(self._last_stderr_lines)
-
         logger.error(
-            f"Native process crashed: {module_name} ({exe_name})",
-            module=module_name,
-            executable=exe_name,
+            "Native process died unexpectedly",
             pid=self._process.pid,
             returncode=rc,
-            last_stderr=last_stderr[:500] if last_stderr else None,
         )
         self.stop()
 
@@ -244,13 +224,10 @@ class NativeModule(Module[_NativeConfig]):
         if stream is None:
             return
         log_fn = getattr(logger, level)
-        is_stderr = level == "warning"
         for raw in stream:
             line = raw.decode("utf-8", errors="replace").rstrip()
             if not line:
                 continue
-            if is_stderr:
-                self._last_stderr_lines.append(line)
             if self.config.log_format == LogFormat.JSON:
                 try:
                     data = json.loads(line)
@@ -271,6 +248,11 @@ class NativeModule(Module[_NativeConfig]):
         if not Path(self.config.executable).is_absolute() and self.config.cwd is not None:
             self.config.executable = str(Path(self.config.cwd) / self.config.executable)
 
+    def _build_cache_name(self) -> str:
+        """Return a stable, unique cache name for this module's build state."""
+        source_file = Path(inspect.getfile(type(self))).resolve()
+        return f"native_{source_file}:{type(self).__qualname__}"
+
     def _maybe_build(self) -> None:
         """Run ``build_command`` if the executable does not exist or sources changed."""
         exe = Path(self.config.executable)
@@ -278,8 +260,9 @@ class NativeModule(Module[_NativeConfig]):
         # Check if rebuild needed due to source changes
         needs_rebuild = False
         if self.config.rebuild_on_change and exe.exists():
-            cache_name = f"native_{type(self).__name__}_build"
-            if did_change(cache_name, self.config.rebuild_on_change, cwd=self.config.cwd):
+            if did_change(
+                self._build_cache_name(), self.config.rebuild_on_change, cwd=self.config.cwd
+            ):
                 logger.info("Source files changed, triggering rebuild", executable=str(exe))
                 needs_rebuild = True
 
@@ -317,22 +300,18 @@ class NativeModule(Module[_NativeConfig]):
             if line.strip():
                 logger.warning(line)
         if proc.returncode != 0:
-            stderr_tail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
             raise RuntimeError(
-                f"Build command failed (exit {proc.returncode}): {self.config.build_command}\n"
-                f"stderr: {stderr_tail}"
+                f"Build command failed (exit {proc.returncode}): {self.config.build_command}"
             )
         if not exe.exists():
             raise FileNotFoundError(
-                f"Build command succeeded but executable still not found: {exe}\n"
-                f"Build output may have been written to a different path. "
-                f"Check that build_command produces the executable at the expected location."
+                f"Build command succeeded but executable still not found: {exe}"
             )
 
-        # Update the change cache so next check is clean
+        # Seed the cache after a successful build so the next check has a baseline
+        # (needed for the initial build when the pre-build change check was skipped)
         if self.config.rebuild_on_change:
-            cache_name = f"native_{type(self).__name__}_build"
-            did_change(cache_name, self.config.rebuild_on_change, cwd=self.config.cwd)
+            did_change(self._build_cache_name(), self.config.rebuild_on_change, cwd=self.config.cwd)
 
     def _collect_topics(self) -> dict[str, str]:
         """Extract LCM topic strings from blueprint-assigned stream transports."""

@@ -38,6 +38,7 @@ import shutil
 import tempfile
 from typing import TYPE_CHECKING
 
+from dimos.utils.change_detect import did_change
 from dimos.utils.logging_config import setup_logger
 
 if TYPE_CHECKING:
@@ -76,14 +77,15 @@ def prepare_urdf_for_drake(
     package_paths = package_paths or {}
     xacro_args = xacro_args or {}
 
-    # Generate cache key
+    # Generate cache key from configuration (not file content — did_change handles that)
     cache_key = _generate_cache_key(urdf_path, package_paths, xacro_args, convert_meshes)
     cache_path = _CACHE_DIR / cache_key / urdf_path.stem
     cache_path.mkdir(parents=True, exist_ok=True)
     cached_urdf = cache_path / f"{urdf_path.stem}.urdf"
 
-    # Check cache
-    if cached_urdf.exists():
+    # Check cache: reuse only if the output exists AND the source file hasn't changed
+    source_changed = did_change(f"urdf_{cache_key}", [str(urdf_path)])
+    if cached_urdf.exists() and not source_changed:
         logger.debug(f"Using cached URDF: {cached_urdf}")
         return str(cached_urdf)
 
@@ -118,16 +120,15 @@ def _generate_cache_key(
 ) -> str:
     """Generate a cache key for the URDF configuration.
 
-    Includes a version number to invalidate cache when processing logic changes.
+    Encodes the configuration inputs (not file content — ``did_change`` handles
+    content-based invalidation separately).  Includes a version number to
+    invalidate the cache when processing logic changes.
     """
-    # Include file modification time
-    mtime = urdf_path.stat().st_mtime if urdf_path.exists() else 0
-
     # Version number to invalidate cache when processing logic changes
     # Increment this when adding new processing steps (e.g., stripping transmission blocks)
-    processing_version = "v2"
+    processing_version = "v3"
 
-    key_data = f"{processing_version}:{urdf_path}:{mtime}:{sorted(package_paths.items())}:{sorted(xacro_args.items())}:{convert_meshes}"
+    key_data = f"{processing_version}:{urdf_path}:{sorted(package_paths.items())}:{sorted(xacro_args.items())}:{convert_meshes}"
     return hashlib.md5(key_data.encode()).hexdigest()[:16]
 
 
