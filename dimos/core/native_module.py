@@ -319,7 +319,9 @@ class NativeModule(Module[_NativeConfig]):
         if self.config.rebuild_on_change:
             from dimos.utils.change_detect import update_cache
 
-            update_cache(self._build_cache_name(), self.config.rebuild_on_change, cwd=self.config.cwd)
+            update_cache(
+                self._build_cache_name(), self.config.rebuild_on_change, cwd=self.config.cwd
+            )
 
     def _collect_topics(self) -> dict[str, str]:
         """Extract LCM topic strings from blueprint-assigned stream transports."""
