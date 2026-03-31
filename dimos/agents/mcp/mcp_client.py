@@ -27,7 +27,6 @@ from langchain_core.tools import StructuredTool
 from langgraph.graph.state import CompiledStateGraph
 from reactivex.disposable import Disposable
 
-from dimos.agents.mcp.tool_stream import ToolStreamEvent
 from dimos.agents.system_prompt import SYSTEM_PROMPT
 from dimos.agents.utils import pretty_print_langchain_message
 from dimos.core.core import rpc
@@ -62,8 +61,6 @@ class McpClient(Module[McpClientConfig]):
     _stop_event: Event
     _http_client: httpx.Client
     _seq_ids: SequentialIds
-    _sse_thread: Thread | None
-    _sse_client: httpx.Client | None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -80,8 +77,6 @@ class McpClient(Module[McpClientConfig]):
         self._stop_event = Event()
         self._http_client = httpx.Client(timeout=120.0)
         self._seq_ids = SequentialIds()
-        self._sse_thread = None
-        self._sse_client = None
 
     def __reduce__(self) -> Any:
         return (self.__class__, (), {})
@@ -103,6 +98,59 @@ class McpClient(Module[McpClientConfig]):
             raise RuntimeError(f"MCP error {data['error']['code']}: {data['error']['message']}")
 
         result: dict[str, Any] = data.get("result")
+        return result
+
+    def _mcp_tool_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Execute a tool call, handling both JSON and SSE streaming responses."""
+        body: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": self._seq_ids.next(),
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+
+        with self._http_client.stream(
+            "POST",
+            self.config.mcp_server_url,
+            json=body,
+            headers={"Accept": "application/json, text/event-stream"},
+        ) as resp:
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+
+            if "text/event-stream" in content_type:
+                return self._consume_sse_tool_response(resp, name)
+
+            data = json.loads(resp.read())
+            if "error" in data:
+                raise RuntimeError(f"MCP error {data['error']['code']}: {data['error']['message']}")
+            result: dict[str, Any] = data.get("result", {})
+            return result
+
+    def _consume_sse_tool_response(
+        self, response: httpx.Response, tool_name: str
+    ) -> dict[str, Any]:
+        """Parse an SSE tool response, injecting notifications as HumanMessages."""
+        result: dict[str, Any] | None = None
+        for line in response.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                data = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+
+            if data.get("method") == "notifications/message":
+                text = data.get("params", {}).get("data", "")
+                if text:
+                    self._message_queue.put(
+                        HumanMessage(content=f"[Tool stream update from '{tool_name}']: {text}")
+                    )
+            elif "result" in data:
+                result = data["result"]
+
+        if result is None:
+            return {"content": [{"type": "text", "text": "Stream ended without result."}]}
         return result
 
     def _fetch_tools(self, timeout: float = 60.0, interval: float = 1.0) -> list[StructuredTool]:
@@ -144,7 +192,7 @@ class McpClient(Module[McpClientConfig]):
         input_schema = mcp_tool.get("inputSchema", {"type": "object", "properties": {}})
 
         def call_tool(**kwargs: Any) -> str:
-            result = self._mcp_request("tools/call", {"name": name, "arguments": kwargs})
+            result = self._mcp_tool_call(name, kwargs)
             content = result.get("content", [])
             parts = [c.get("text", "") for c in content if c.get("type") == "text"]
             text = "\n".join(parts)
@@ -194,18 +242,11 @@ class McpClient(Module[McpClientConfig]):
             )
             self._thread.start()
 
-        self._start_sse_listener()
-
     @rpc
     def stop(self) -> None:
         self._stop_event.set()
-        with self._lock:
-            if self._sse_client is not None:
-                self._sse_client.close()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        if self._sse_thread is not None and self._sse_thread.is_alive():
-            self._sse_thread.join(timeout=2.0)
         self._http_client.close()
         super().stop()
 
@@ -254,7 +295,7 @@ class McpClient(Module[McpClientConfig]):
                     tool_args[key] = continuation_context[context_key]
 
         try:
-            result = self._mcp_request("tools/call", {"name": tool_name, "arguments": tool_args})
+            result = self._mcp_tool_call(tool_name, tool_args)
             content = result.get("content", [])
             parts = [c.get("text", "") for c in content if c.get("type") == "text"]
             text = "\n".join(parts)
@@ -301,53 +342,6 @@ class McpClient(Module[McpClientConfig]):
 
         if self._message_queue.empty():
             self.agent_idle.publish(True)
-
-    def _start_sse_listener(self) -> None:
-        """Connect to the MCP server SSE endpoint to receive tool stream updates."""
-        self._sse_thread = Thread(target=self._sse_loop, name="McpClient-SSE", daemon=True)
-        self._sse_thread.start()
-
-    def _sse_loop(self) -> None:
-        base_url = self.config.mcp_server_url.rsplit("/mcp", 1)[0]
-        sse_url = f"{base_url}/mcp/streams"
-
-        while not self._stop_event.is_set():
-            try:
-                self._sse_connect(sse_url)
-            except Exception:
-                if not self._stop_event.is_set():
-                    # Try reconnecting after a short delay
-                    time.sleep(1.0)
-
-    def _sse_connect(self, sse_url: str) -> None:
-        client = httpx.Client(timeout=None)
-        with self._lock:
-            self._sse_client = client
-        try:
-            with client.stream("GET", sse_url) as response:
-                self._sse_consume(response)
-        finally:
-            with self._lock:
-                self._sse_client = None
-            client.close()
-
-    def _sse_consume(self, response: httpx.Response) -> None:
-        for line in response.iter_lines():
-            if self._stop_event.is_set():
-                return
-            if not line.startswith("data: "):
-                continue
-            try:
-                data = json.loads(line[6:])
-            except json.JSONDecodeError:
-                continue
-            event = ToolStreamEvent(**data)
-            if event.type == "update":
-                self._message_queue.put(
-                    HumanMessage(
-                        content=f"[Tool stream update from '{event.tool_name}']: {event.text}"
-                    )
-                )
 
 
 def _append_image_to_history(

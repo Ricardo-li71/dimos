@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 import concurrent.futures
+from dataclasses import dataclass
 import json
 import os
 import time
@@ -30,6 +31,7 @@ from starlette.responses import Response, StreamingResponse
 import uvicorn
 
 from dimos.agents.annotation import skill
+from dimos.agents.mcp.tool_stream import ToolStreamEvent
 from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.rpc_client import RpcCall, RPCClient
@@ -66,12 +68,20 @@ def _jsonrpc_error(req_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+@dataclass(frozen=True, slots=True)
+class _StreamingToolResult:
+    """Marker returned when a tool starts a background stream."""
+
+    req_id: Any
+    tool_name: str
+
+
 def _handle_initialize(req_id: Any) -> dict[str, Any]:
     return _jsonrpc_result(
         req_id,
         {
             "protocolVersion": "2025-11-25",
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "logging": {}},
             "serverInfo": {"name": "dimensional", "version": "1.0.0"},
         },
     )
@@ -94,7 +104,7 @@ def _handle_tools_list(req_id: Any, skills: list[SkillInfo]) -> dict[str, Any]:
 
 async def _handle_tools_call(
     req_id: Any, params: dict[str, Any], rpc_calls: dict[str, Any]
-) -> dict[str, Any]:
+) -> dict[str, Any] | _StreamingToolResult:
     name = params.get("name", "")
     args: dict[str, Any] = params.get("arguments") or {}
 
@@ -115,8 +125,8 @@ async def _handle_tools_call(
     duration = f"{time.monotonic() - t0:.3f}s"
 
     if result is None:
-        logger.info("MCP tool done (async)", tool=name, duration=duration)
-        return _jsonrpc_result_text(req_id, "It has started. You will be updated later.")
+        logger.info("MCP tool streaming", tool=name, duration=duration)
+        return _StreamingToolResult(req_id=req_id, tool_name=name)
 
     response = str(result)[:200]
     if hasattr(result, "agent_encode"):
@@ -131,7 +141,7 @@ async def handle_request(
     request: dict[str, Any],
     skills: list[SkillInfo],
     rpc_calls: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | _StreamingToolResult | None:
     """Handle a single MCP JSON-RPC request.
 
     Returns None for JSON-RPC notifications (no ``id``), which must not
@@ -165,27 +175,101 @@ async def mcp_endpoint(request: Request) -> Response:
             {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
             status_code=400,
         )
+
+    # Pre-register a queue for tool stream events when the client accepts SSE.
+    accept = request.headers.get("accept", "")
+    is_tool_call = body.get("method") == "tools/call"
+    client_accepts_sse = "text/event-stream" in accept
+
+    stream_queue: asyncio.Queue[dict[str, Any]] | None = None
+    if is_tool_call and client_accepts_sse:
+        stream_queue = asyncio.Queue()
+        app.state.sse_queues.append(stream_queue)
+
     result = await handle_request(body, request.app.state.skills, request.app.state.rpc_calls)
+
+    # Streaming tool: return SSE response if client supports it.
+    if isinstance(result, _StreamingToolResult):
+        if stream_queue is not None:
+            return _streaming_tool_response(result, stream_queue)
+        # Client doesn't support SSE — fall back to immediate JSON.
+        return JSONResponse(
+            _jsonrpc_result_text(result.req_id, "It has started. You will be updated later.")
+        )
+
+    # Non-streaming: remove the pre-registered queue if any.
+    if stream_queue is not None:
+        try:
+            app.state.sse_queues.remove(stream_queue)
+        except ValueError:
+            pass
+
     if result is None:
         return Response(status_code=204)
     return JSONResponse(result)
 
 
-@app.get("/mcp/streams")
-async def streams_sse_endpoint() -> StreamingResponse:
-    """Server-Sent Events endpoint for tool stream updates.
+_STREAM_TIMEOUT = 300.0  # seconds
 
-    Clients subscribe here to receive real-time updates from long-running
-    skills that use ``ToolStream``.
+
+def _sse_event(data: dict[str, Any]) -> str:
+    """Format a JSON-RPC message as an SSE ``event: message`` frame."""
+    return f"event: message\ndata: {json.dumps(data)}\n\n"
+
+
+def _streaming_tool_response(
+    streaming: _StreamingToolResult,
+    queue: asyncio.Queue[dict[str, Any]],
+) -> StreamingResponse:
+    """Build an SSE response that forwards ToolStream events as MCP log notifications.
+
+    The response streams ``notifications/message`` for each update and ends
+    with the JSON-RPC result carrying the accumulated text.
     """
-    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    app.state.sse_queues.append(queue)
 
     async def event_generator() -> AsyncGenerator[str, None]:
+        stream_id: str | None = None
+        collected: list[str] = []
         try:
             while True:
-                data = await queue.get()
-                yield f"data: {json.dumps(data)}\n\n"
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=_STREAM_TIMEOUT)
+                except asyncio.TimeoutError:
+                    text = "\n".join(collected) if collected else "No updates received."
+                    yield _sse_event(_jsonrpc_result_text(streaming.req_id, text))
+                    return
+
+                try:
+                    event = ToolStreamEvent(**data)
+                except (TypeError, KeyError):
+                    continue
+
+                # Filter: match by tool_name, lock onto the first stream_id seen.
+                if event.tool_name != streaming.tool_name:
+                    continue
+                if stream_id is None:
+                    stream_id = event.stream_id
+                elif event.stream_id != stream_id:
+                    continue
+
+                if event.type == "update" and event.text:
+                    collected.append(event.text)
+                    yield _sse_event(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/message",
+                            "params": {
+                                "level": "info",
+                                "logger": event.tool_name,
+                                "data": event.text,
+                            },
+                        }
+                    )
+
+                elif event.type == "close":
+                    text = "\n".join(collected) if collected else "Stream completed."
+                    yield _sse_event(_jsonrpc_result_text(streaming.req_id, text))
+                    return
         except asyncio.CancelledError:
             pass
         finally:

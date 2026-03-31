@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import json
-from threading import Event, Thread
+from threading import Thread
 import time
 
 import httpx
@@ -23,7 +23,7 @@ import pytest
 from dimos.agents.annotation import skill
 from dimos.agents.mcp.mcp_adapter import McpAdapter
 from dimos.agents.mcp.mcp_server import McpServer
-from dimos.agents.mcp.tool_stream import ToolStream, ToolStreamEvent
+from dimos.agents.mcp.tool_stream import ToolStream
 from dimos.core.blueprints import autoconnect
 from dimos.core.global_config import global_config
 from dimos.core.module import Module
@@ -67,58 +67,44 @@ def mcp_server():
 
 
 @pytest.mark.slow
-def test_tool_stream_sse(mcp_server: McpAdapter) -> None:
-    """ToolStream updates flow through the HTTP SSE endpoint."""
+def test_tool_stream_inline_sse(mcp_server: McpAdapter) -> None:
+    """Streaming tool returns inline SSE notifications when client accepts SSE."""
     adapter = mcp_server
-    base_url = adapter.url.rsplit("/mcp", 1)[0]
-    sse_url = f"{base_url}/mcp/streams"
+    adapter.initialize()
 
-    events: list[ToolStreamEvent] = []
-    sse_connected = Event()
-    sse_done = Event()
+    body = {
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "tools/call",
+        "params": {"name": "start_streaming", "arguments": {"count": 3}},
+    }
 
-    def sse_reader() -> None:
-        try:
-            with httpx.Client(timeout=None) as client:
-                with client.stream("GET", sse_url) as resp:
-                    sse_connected.set()
-                    for line in resp.iter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        event = ToolStreamEvent(**json.loads(line[6:]))
-                        events.append(event)
-                        if event.type == "close":
-                            sse_done.set()
-                            return
-        except Exception:
-            pass  # connection closed during teardown
+    events = []
+    with httpx.Client(timeout=30.0) as client:
+        with client.stream(
+            "POST",
+            adapter.url,
+            json=body,
+            headers={"Accept": "application/json, text/event-stream"},
+        ) as response:
+            assert response.headers["content-type"].startswith("text/event-stream")
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
 
-    reader = Thread(target=sse_reader, daemon=True)
-    reader.start()
-    assert sse_connected.wait(5), "SSE connection was not established"
-    time.sleep(0.5)  # let the server register the SSE queue
+    notifications = [e for e in events if e.get("method") == "notifications/message"]
+    results = [e for e in events if "result" in e]
 
-    # Call the streaming tool via MCP.
-    result = adapter.call_tool("start_streaming", {"count": 3})
-    assert "It has started" in result["content"][0]["text"]
+    assert len(notifications) == 3
+    assert notifications[0]["params"]["data"] == "Update 1 of 3"
+    assert notifications[1]["params"]["data"] == "Update 2 of 3"
+    assert notifications[2]["params"]["data"] == "Update 3 of 3"
 
-    # Wait for all SSE events (updates + close).
-    assert sse_done.wait(10), "Timed out waiting for tool stream close event"
-
-    updates = [e for e in events if e.type == "update"]
-    closes = [e for e in events if e.type == "close"]
-
-    assert len(updates) == 3
-    assert updates[0].text == "Update 1 of 3"
-    assert updates[1].text == "Update 2 of 3"
-    assert updates[2].text == "Update 3 of 3"
-
-    assert len(closes) == 1
-
-    # All events share the same stream id and tool name.
-    stream_ids = {e.stream_id for e in events}
-    assert len(stream_ids) == 1
-    assert all(e.tool_name == "start_streaming" for e in events)
+    assert len(results) == 1
+    assert results[0]["id"] == 42
+    content_text = results[0]["result"]["content"][0]["text"]
+    assert "Update 1 of 3" in content_text
+    assert "Update 3 of 3" in content_text
 
 
 @pytest.mark.slow

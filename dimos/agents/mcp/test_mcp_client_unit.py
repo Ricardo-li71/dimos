@@ -91,11 +91,28 @@ def _mock_post(url: str, **kwargs: object) -> MagicMock:
     return resp
 
 
+def _mock_stream(_method: str, _url: str, **kwargs: object) -> MagicMock:
+    """Wrap ``_mock_post`` result as an httpx streaming context manager."""
+    post_resp = _mock_post(_url, **kwargs)
+    json_bytes = json.dumps(post_resp.json.return_value).encode()
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.headers = {"content-type": "application/json"}
+    resp.read.return_value = json_bytes
+
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=resp)
+    cm.__exit__ = MagicMock(return_value=False)
+    return cm
+
+
 @pytest.fixture
 def mcp_client() -> McpClient:
     """Build an McpClient wired to the mock MCP post handler."""
     mock_http = MagicMock()
     mock_http.post.side_effect = _mock_post
+    mock_http.stream.side_effect = _mock_stream
 
     with patch("dimos.agents.mcp.mcp_client.httpx.Client", return_value=mock_http):
         client = McpClient.__new__(McpClient)
