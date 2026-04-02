@@ -103,6 +103,10 @@ def make_connection(ip: str | None, cfg: GlobalConfig) -> Go2ConnectionProtocol:
         from dimos.robot.unitree.mujoco_connection import MujocoConnection
 
         return MujocoConnection(cfg)
+    elif connection_type == "dimsim":
+        from dimos.robot.unitree.dimsim_connection import DimSimConnection
+
+        return DimSimConnection(cfg)
     else:
         assert ip is not None, "IP address must be provided"
         return UnitreeWebRTCConnection(ip)
