@@ -128,23 +128,80 @@ class DimSimConnection:
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _kill_port_holder(port: int) -> None:
+        """Kill any process listening on the given port."""
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            pids = result.stdout.strip()
+            if pids:
+                for pid in pids.splitlines():
+                    logger.info(f"Killing stale process {pid} on port {port}")
+                    subprocess.run(["kill", pid], timeout=5)
+                time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"Failed to check/kill port {port}: {e}")
+
+    @staticmethod
+    def _ensure_scene(dimsim_bin: str, scene: str) -> None:
+        """Run dimsim setup and scene install (skips if already cached)."""
+        logger.info("Checking dimsim core assets...")
+        subprocess.run([dimsim_bin, "setup"], check=True)
+        logger.info(f"Checking dimsim scene '{scene}'...")
+        subprocess.run([dimsim_bin, "scene", "install", scene], check=True)
+
+    def _start_log_reader(self) -> None:
+        """Read subprocess stdout/stderr and log them."""
+        assert self.process is not None
+
+        def _reader(stream: subprocess.PIPE, label: str) -> None:  # type: ignore[valid-type]
+            if stream is None:
+                return
+            for raw in stream:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    logger.info(f"[dimsim {label}] {line}")
+
+        for stream, label in [
+            (self.process.stdout, "out"),
+            (self.process.stderr, "err"),
+        ]:
+            t = threading.Thread(target=_reader, args=(stream, label), daemon=True)
+            t.start()
+
     def start(self) -> None:
         dimsim_bin = _find_dimsim()
         scene = self.global_config.dimsim_scene
         port = self.global_config.dimsim_port
 
-        cmd = [dimsim_bin, "dev", "--scene", scene, "--port", str(port)]
+        self._ensure_scene(dimsim_bin, scene)
+        self._kill_port_holder(port)
 
-        if os.environ.get("DIMSIM_HEADLESS", "").strip() in ("1", "true"):
-            render = os.environ.get("DIMSIM_RENDER", "cpu").strip()
-            cmd.extend(["--headless", "--render", render])
+        render = os.environ.get("DIMSIM_RENDER", "gpu").strip()
+        cmd = [
+            dimsim_bin,
+            "dev",
+            "--scene",
+            scene,
+            "--port",
+            str(port),
+            "--headless",
+            "--render",
+            render,
+        ]
 
         logger.info(f"Starting DimSim: {' '.join(cmd)}")
         try:
-            self.process = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except Exception as e:
             raise RuntimeError(f"Failed to start DimSim subprocess: {e}") from e
 
+        self._start_log_reader()
         self._start_lcm_listener()
 
         # Wait for first odom message as readiness signal.
@@ -152,8 +209,12 @@ class DimSimConnection:
         start_time = time.time()
         while time.time() - start_time < timeout:
             if self.process.poll() is not None:
+                exit_code = self.process.returncode
+                stderr = ""
+                if self.process.stderr:
+                    stderr = self.process.stderr.read().decode(errors="replace")
                 self.stop()
-                raise RuntimeError(f"DimSim process exited early (code {self.process.returncode})")
+                raise RuntimeError(f"DimSim process exited early (code {exit_code})\n{stderr}")
             if self._odom_seq > 0:
                 logger.info("DimSim process started successfully")
                 atexit.register(self._atexit_cleanup)
@@ -211,12 +272,17 @@ class DimSimConnection:
     # ── LCM listener ──────────────────────────────────────────────────
 
     def _start_lcm_listener(self) -> None:
+        from dimos.protocol.service.lcmservice import autoconf
+
+        autoconf()
+
         lc = lcm_mod.LCM()
         self._lcm = lc
 
-        lc.subscribe("/odom", self._on_odom)
-        lc.subscribe("/color_image", self._on_color_image)
-        lc.subscribe("/lidar", self._on_lidar)
+        # Subscribe to everything and dispatch by channel name. This avoids
+        # issues with exact-match vs regex and with type-suffixed channel names
+        # (e.g. "/odom#geometry_msgs.PoseStamped").
+        lc.subscribe(".*", self._on_lcm_message)
 
         def loop() -> None:
             while not self._stop_event.is_set():
@@ -229,26 +295,25 @@ class DimSimConnection:
         self._lcm_thread = threading.Thread(target=loop, daemon=True)
         self._lcm_thread.start()
 
-    def _on_odom(self, _channel: str, data: bytes) -> None:
-        try:
-            self._latest_odom = PoseStamped.lcm_decode(data)
-            self._odom_seq += 1
-        except Exception as e:
-            logger.error(f"Failed to decode odom: {e}")
+    def _on_lcm_message(self, channel: str, data: bytes) -> None:
+        # Strip type suffix if present (e.g. "/odom#geometry_msgs.PoseStamped" → "/odom")
+        base = channel.split("#")[0]
 
-    def _on_color_image(self, _channel: str, data: bytes) -> None:
         try:
-            self._latest_image = Image.lcm_jpeg_decode(data)
-            self._image_seq += 1
+            if base == "/odom":
+                self._latest_odom = PoseStamped.lcm_decode(data)
+                self._odom_seq += 1
+            elif base == "/color_image":
+                self._latest_image = Image.lcm_decode(data)
+                self._image_seq += 1
+            elif base == "/lidar":
+                self._latest_lidar = PointCloud2.lcm_decode(data)
+                self._lidar_seq += 1
+            elif self._odom_seq == 0:
+                # Debug: log channels we see before odom arrives
+                logger.info(f"LCM '{channel}' ({len(data)} bytes)")
         except Exception as e:
-            logger.error(f"Failed to decode image: {e}")
-
-    def _on_lidar(self, _channel: str, data: bytes) -> None:
-        try:
-            self._latest_lidar = PointCloud2.lcm_decode(data)
-            self._lidar_seq += 1
-        except Exception as e:
-            logger.error(f"Failed to decode lidar: {e}")
+            logger.error(f"Failed to decode {channel}: {e}")
 
     # ── Observable streams ────────────────────────────────────────────
 
